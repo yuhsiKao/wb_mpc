@@ -42,20 +42,31 @@ vector_t WbcBase::update(const vector_t& stateDesired, const vector_t& inputDesi
   return {};
 }
 
+// Update qMeasured_ and vMeasured_ from rebdStateMeasured (Pinocchio format)
+// and compute the contact point Jacobian (j_) and its time derivative (dj_).
 void WbcBase::updateMeasured(const vector_t& rbdStateMeasured) {
-  qMeasured_.head<3>() = rbdStateMeasured.segment<3>(3);
-  qMeasured_.segment<3>(3) = rbdStateMeasured.head<3>();
-  qMeasured_.tail(info_.actuatedDofNum) = rbdStateMeasured.segment(6, info_.actuatedDofNum);
-  vMeasured_.head<3>() = rbdStateMeasured.segment<3>(info_.generalizedCoordinatesNum + 3);
-  vMeasured_.segment<3>(3) = getEulerAnglesZyxDerivativesFromGlobalAngularVelocity<scalar_t>(
+  qMeasured_.head<3>() = rbdStateMeasured.segment<3>(3);  // base position
+  qMeasured_.segment<3>(3) = rbdStateMeasured.head<3>();  // base orientation (Euler angles)
+  qMeasured_.tail(info_.actuatedDofNum) = rbdStateMeasured.segment(6, info_.actuatedDofNum);   // joint angles
+  vMeasured_.head<3>() = rbdStateMeasured.segment<3>(info_.generalizedCoordinatesNum + 3);     // base linear velocity
+  vMeasured_.segment<3>(3) = getEulerAnglesZyxDerivativesFromGlobalAngularVelocity<scalar_t>(  // base angular velocity → Euler angle derivatives
       qMeasured_.segment<3>(3), rbdStateMeasured.segment<3>(info_.generalizedCoordinatesNum));
-  vMeasured_.tail(info_.actuatedDofNum) = rbdStateMeasured.segment(info_.generalizedCoordinatesNum + 6, info_.actuatedDofNum);
+  vMeasured_.tail(info_.actuatedDofNum) = rbdStateMeasured.segment(info_.generalizedCoordinatesNum + 6, info_.actuatedDofNum);  // joint angular velocity
 
   const auto& model = pinocchioInterfaceMeasured_.getModel();
   auto& data = pinocchioInterfaceMeasured_.getData();
 
   // For floating base EoM task
-  pinocchio::forwardKinematics(model, data, qMeasured_, vMeasured_);
+  /**
+   * Pinocchio Kinematics & Dynamics Functions:
+   * 
+   * - forwardKinematics:     Computes the positions and velocities for all frames.
+   * - computeJointJacobians: Calculates the Joint Jacobian matrix (J).
+   * - updateFramePlacements: Updates the world-frame poses (placements) of all frames.
+   * - crba:                  Computes the Mass Matrix (M) using the Composite Rigid Body Algorithm.
+   * - nonLinearEffects:      Computes non-linear terms (Coriolis, centrifugal, and gravity).
+   */
+  pinocchio::forwardKinematics(model, data, qMeasured_, vMeasured_);  
   pinocchio::computeJointJacobians(model, data);
   pinocchio::updateFramePlacements(model, data);
   pinocchio::crba(model, data, qMeasured_);
@@ -97,6 +108,13 @@ void WbcBase::updateDesired(const vector_t& stateDesired, const vector_t& inputD
 Task WbcBase::formulateFloatingBaseEomTask() {
   auto& data = pinocchioInterfaceMeasured_.getData();
 
+  /**
+   * Construct Selection Matrix S ∈ ℝ^(a × n)
+   * Mapping: S = [ 0_(a×6) | I_(a×a) ]
+   *                ↑         ↑
+   *          Floating Base  Actuated Joints
+   *          (Unactuated)   (Torque Inputs)
+   */
   matrix_t s(info_.actuatedDofNum, info_.generalizedCoordinatesNum);
   s.block(0, 0, info_.actuatedDofNum, 6).setZero();
   s.block(0, 6, info_.actuatedDofNum, info_.actuatedDofNum).setIdentity();
@@ -108,7 +126,6 @@ Task WbcBase::formulateFloatingBaseEomTask() {
 }
 
 // Torque limits task: tau_j <= tau_max, -tau_j <= tau_max  →  [I; -I] * tau_j <= [tau_max; tau_max]
-// 力矩上下限不等式約束
 Task WbcBase::formulateTorqueLimitsTask() {
   matrix_t d(2 * info_.actuatedDofNum, numDecisionVars_);
   d.setZero();
@@ -125,7 +142,14 @@ Task WbcBase::formulateTorqueLimitsTask() {
 }
 
 // Contact force task: Fc = inputDesired.head(3*numContacts_)  →  [I, 0, 0] * [a; Fc; tau_j] = inputDesired.head(3*numContacts_)
-// 接觸腳零加速度約束
+/**
+ * @brief Computes foot acceleration in task space.
+ * 
+ * Formula: a_foot = J * q_ddot + dJ * q_dot
+ * - J:  Contact Jacobian (j_)
+ * - dJ: Time derivative of the Jacobian (dj_)
+ * - q_dot / q_ddot: Joint velocity and acceleration
+ */
 Task WbcBase::formulateNoContactMotionTask() {
   matrix_t a(3 * numContacts_, numDecisionVars_);
   vector_t b(a.rows());
@@ -144,6 +168,7 @@ Task WbcBase::formulateNoContactMotionTask() {
 }
 
 Task WbcBase::formulateFrictionConeTask() {
+  // swing legs: Fc = 0
   matrix_t a(3 * (info_.numThreeDofContacts - numContacts_), numDecisionVars_);
   a.setZero();
   size_t j = 0;
@@ -155,6 +180,7 @@ Task WbcBase::formulateFrictionConeTask() {
   vector_t b(a.rows());
   b.setZero();
 
+  // contact legs: friction cone constraints
   matrix_t frictionPyramic(5, 3);  // clang-format off
   frictionPyramic << 0, 0, -1,
                      1, 0, -frictionCoeff_,
@@ -175,7 +201,7 @@ Task WbcBase::formulateFrictionConeTask() {
   return {a, b, d, f};
 }
 
-// 追蹤 MPC 輸出的基座加速度
+// Track the desired base acceleration output from the MPC. (4)
 Task WbcBase::formulateBaseAccelTask(const vector_t& stateDesired, const vector_t& inputDesired, scalar_t period) {
   matrix_t a(6, numDecisionVars_);
   a.setZero();
@@ -195,17 +221,26 @@ Task WbcBase::formulateBaseAccelTask(const vector_t& stateDesired, const vector_
   const auto AbInv = computeFloatingBaseCentroidalMomentumMatrixInverse(Ab);
   const auto Aj = A.rightCols(info_.actuatedDofNum);
   const auto ADot = pinocchio::dccrba(model, data, qDesired, vDesired);
+
+  // Desired centroidal momentum rate (h_dot_com) from MPC state
   Vector6 centroidalMomentumRate = info_.robotMass * getNormalizedCentroidalMomentumRate(pinocchioInterfaceDesired_, info_, inputDesired);
-  centroidalMomentumRate.noalias() -= ADot * vDesired;
-  centroidalMomentumRate.noalias() -= Aj * jointAccel;
+  centroidalMomentumRate.noalias() -= ADot * vDesired;  // -= Ȧ · q̇
+  centroidalMomentumRate.noalias() -= Aj * jointAccel;  // -= A_j · q̈_j
 
   Vector6 b = AbInv * centroidalMomentumRate;
 
   return {a, b, matrix_t(), vector_t()};
 }
 
-// 擺動腿末端加速度追蹤
+// Track the desired swing leg end-effector acceleration.
+// 為所有懸空腳建立足端軌跡追蹤的等式約束，讓 WBC 在廣義加速度層面控制足端位置與速度
 Task WbcBase::formulateSwingLegTask() {
+  /**
+   * Compute foot tracking errors:
+   * 1. Calculate FK for the measured state (current position/velocity).
+   * 2. Calculate FK for the MPC reference state (desired position/velocity).
+   * 3. The difference between the two results defines the tracking error.
+   */
   eeKinematics_->setPinocchioInterface(pinocchioInterfaceMeasured_);
   std::vector<vector3_t> posMeasured = eeKinematics_->getPosition(vector_t());
   std::vector<vector3_t> velMeasured = eeKinematics_->getVelocity(vector_t(), vector_t());
@@ -220,6 +255,7 @@ Task WbcBase::formulateSwingLegTask() {
   size_t j = 0;
   for (size_t i = 0; i < info_.numThreeDofContacts; ++i) {
     if (!contactFlag_[i]) {
+      // Compute the desired foot acceleration using a Task-space PD control law.
       vector3_t accel = swingKp_ * (posDesired[i] - posMeasured[i]) + swingKd_ * (velDesired[i] - velMeasured[i]);
       a.block(3 * j, 0, 3, info_.generalizedCoordinatesNum) = j_.block(3 * i, 0, 3, info_.generalizedCoordinatesNum);
       b.segment(3 * j, 3) = accel - dj_.block(3 * i, 0, 3, info_.generalizedCoordinatesNum) * vMeasured_;
@@ -230,7 +266,7 @@ Task WbcBase::formulateSwingLegTask() {
   return {a, b, matrix_t(), vector_t()};
 }
 
-// 追蹤 MPC 期望接觸力
+// Track the desired contact forces from the MPC
 Task WbcBase::formulateContactForceTask(const vector_t& inputDesired) const {
   matrix_t a(3 * info_.numThreeDofContacts, numDecisionVars_);
   vector_t b(a.rows());

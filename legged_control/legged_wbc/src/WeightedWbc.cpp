@@ -47,10 +47,13 @@ vector_t WeightedWbc::update(const vector_t& stateDesired, const vector_t& input
   return qpSol;
 }
 
+// Constraints (Hard): EoM, torque limits, friction cone, no-contact-motion
 Task WeightedWbc::formulateConstraints() {
   return formulateFloatingBaseEomTask() + formulateTorqueLimitsTask() + formulateFrictionConeTask() + formulateNoContactMotionTask();
 }
 
+// Tasks (Soft): swing leg tracking, base acceleration tracking, contact force tracking
+// Formulate the weighted QP cost function.
 Task WeightedWbc::formulateWeightedTasks(const vector_t& stateDesired, const vector_t& inputDesired, scalar_t period) {
   return formulateSwingLegTask() * weightSwingLeg_ + formulateBaseAccelTask(stateDesired, inputDesired, period) * weightBaseAccel_ +
          formulateContactForceTask(inputDesired) * weightContactForce_;

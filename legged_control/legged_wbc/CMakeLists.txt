@@ -8,9 +8,13 @@ find_package(catkin REQUIRED
         roscpp
         ocs2_legged_robot
         qpoases_catkin
+        casadi_catkin
         )
 
 find_package(Eigen3 3.3 REQUIRED NO_MODULE)
+
+# CasADi is built and installed to devel/ by casadi_catkin.
+find_package(casadi CONFIG REQUIRED HINTS ${CATKIN_DEVEL_PREFIX})
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(pinocchio REQUIRED pinocchio)
@@ -47,11 +51,13 @@ add_library(${PROJECT_NAME}
         src/WbcBase.cpp
         src/HierarchicalWbc.cpp
         src/WeightedWbc.cpp
+        src/RneaWbc.cpp
         )
 
 target_link_libraries(${PROJECT_NAME}
         ${catkin_LIBRARIES}
         ${pinocchio_LIBRARIES}
+        casadi
         )
 
 target_compile_options(${PROJECT_NAME} PUBLIC ${OCS2_CXX_FLAGS})

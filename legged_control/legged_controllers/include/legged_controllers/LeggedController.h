@@ -17,6 +17,10 @@
 #include <legged_interface/LeggedInterface.h>
 #include <legged_wbc/WbcBase.h>
 
+#include <realtime_tools/realtime_publisher.h>
+#include <std_msgs/Float64.h>
+#include <std_msgs/Float64MultiArray.h>
+
 #include "legged_controllers/SafetyChecker.h"
 #include "legged_controllers/visualization/LeggedSelfCollisionVisualization.h"
 
@@ -58,6 +62,7 @@ class LeggedController : public controller_interface::MultiInterfaceController<H
 
   // Whole Body Control
   std::shared_ptr<WbcBase> wbc_;
+  std::shared_ptr<WbcBase> wbcRef_;  // reference solver for comparison (HierarchicalWbc)
   std::shared_ptr<SafetyChecker> safetyChecker_;
 
   // Nonlinear MPC
@@ -68,6 +73,10 @@ class LeggedController : public controller_interface::MultiInterfaceController<H
   std::shared_ptr<LeggedRobotVisualizer> robotVisualizer_;
   std::shared_ptr<LeggedSelfCollisionVisualization> selfCollisionVisualization_;
   ros::Publisher observationPublisher_;
+  std::shared_ptr<realtime_tools::RealtimePublisher<std_msgs::Float64MultiArray>> torquePublisher_;
+  std::shared_ptr<realtime_tools::RealtimePublisher<std_msgs::Float64MultiArray>> torqueRefPublisher_;
+  std::shared_ptr<realtime_tools::RealtimePublisher<std_msgs::Float64>> torqueDiffPublisher_;
+  std::shared_ptr<realtime_tools::RealtimePublisher<std_msgs::Float64MultiArray>> torqueDiffRearPublisher_;
 
  private:
   std::thread mpcThread_;

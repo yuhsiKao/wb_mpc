@@ -71,8 +71,18 @@ bool LeggedController::init(hardware_interface::RobotHW* robot_hw, ros::NodeHand
                                     *eeKinematicsPtr_);
   wbc_->loadTasksSetting(taskFile, verbose);
 
+  // wbcRef_ = std::make_shared<WeightedWbc>(leggedInterface_->getPinocchioInterface(), leggedInterface_->getCentroidalModelInfo(),
+  //                                              *eeKinematicsPtr_);
+  // wbcRef_->loadTasksSetting(taskFile, verbose);
+
   // Safety Checker
   safetyChecker_ = std::make_shared<SafetyChecker>(leggedInterface_->getCentroidalModelInfo());
+
+  // Torque publishers
+  // torquePublisher_     = std::make_shared<realtime_tools::RealtimePublisher<std_msgs::Float64MultiArray>>(controller_nh, "torque", 1);
+  // torqueRefPublisher_  = std::make_shared<realtime_tools::RealtimePublisher<std_msgs::Float64MultiArray>>(controller_nh, "torque_ref", 1);
+  // torqueDiffPublisher_     = std::make_shared<realtime_tools::RealtimePublisher<std_msgs::Float64>>(controller_nh, "torque_diff_linf", 1);
+  // torqueDiffRearPublisher_ = std::make_shared<realtime_tools::RealtimePublisher<std_msgs::Float64MultiArray>>(controller_nh, "torque_diff_rear", 1);
 
   return true;
 }
@@ -117,11 +127,39 @@ void LeggedController::update(const ros::Time& time, const ros::Duration& period
   // Whole body control
   currentObservation_.input = optimizedInput;
 
+  // Run WeightedWbc (QP) for comparison only.
+  // vector_t xRef = wbcRef_->update(optimizedState, optimizedInput, measuredRbdState_, plannedMode, period.toSec());
+
+  // Run RneaWbc (NLP).
   wbcTimer_.startTimer();
   vector_t x = wbc_->update(optimizedState, optimizedInput, measuredRbdState_, plannedMode, period.toSec());
   wbcTimer_.endTimer();
 
-  vector_t torque = x.tail(12);
+  vector_t torque    = x.tail(12);
+  // vector_t torqueRef = xRef.tail(12);
+  // ROS_INFO_STREAM_THROTTLE(1.0, "RNEA tau       : " << torque.transpose());
+  // ROS_INFO_STREAM_THROTTLE(1.0, "WeightedWbc tau: " << torqueRef.transpose());
+  // ROS_INFO_STREAM_THROTTLE(1.0, "diff           : " << (torque - torqueRef).transpose());
+
+  // const vector_t diff = torque - torqueRef;
+  // if (torqueDiffRearPublisher_->trylock()) {
+  //   auto& d = torqueDiffRearPublisher_->msg_.data;
+  //   d = {diff(3), diff(4), diff(5), diff(9), diff(10), diff(11)};
+  //   torqueDiffRearPublisher_->unlockAndPublish();
+  // }
+
+  // if (torquePublisher_->trylock()) {
+  //   torquePublisher_->msg_.data.assign(torque.data(), torque.data() + torque.size());
+  //   torquePublisher_->unlockAndPublish();
+  // }
+  // if (torqueRefPublisher_->trylock()) {
+  //   torqueRefPublisher_->msg_.data.assign(torqueRef.data(), torqueRef.data() + torqueRef.size());
+  //   torqueRefPublisher_->unlockAndPublish();
+  // }
+  // if (torqueDiffPublisher_->trylock()) {
+  //   torqueDiffPublisher_->msg_.data = (torque - torqueRef).lpNorm<Eigen::Infinity>();
+  //   torqueDiffPublisher_->unlockAndPublish();
+  // }
 
   vector_t posDes = centroidal_model::getJointAngles(optimizedState, leggedInterface_->getCentroidalModelInfo());
   vector_t velDes = centroidal_model::getJointVelocities(optimizedInput, leggedInterface_->getCentroidalModelInfo());

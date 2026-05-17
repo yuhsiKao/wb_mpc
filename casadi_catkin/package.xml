@@ -1,0 +1,10 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>casadi_catkin</name>
+  <version>3.7.0</version>
+  <description>Catkin wrapper that builds CasADi from the local source tree.</description>
+  <maintainer email="fishc1216@gmail.com">YuHsi Kao</maintainer>
+  <license>LGPL</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+</package>
