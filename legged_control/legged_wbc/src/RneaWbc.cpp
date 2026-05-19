@@ -31,122 +31,179 @@ void RneaWbc::buildNlp() {
 
   const auto& model = pinocchioInterfaceMeasured_.getModel();
   ADModel ad_model  = model.template cast<ADScalar>();
-  ADData  ad_data(ad_model);
 
-  const int nq = model.nq;  // == info_.generalizedCoordinatesNum (Euler-angle floating base)
-  const int nv = model.nv;
-  const int nj = static_cast<int>(info_.actuatedDofNum);
-  const int nc = static_cast<int>(info_.numThreeDofContacts);
-  const int nu = nv + 3 * nc + nj;  // decision: [a(nv), Fc(3*nc), tau_j(nj)]
-
-  // ── NLP parameters:
-  //    p = [q(nq); v(nv); H_flat(nu²); g_obj(nu); J_nc_flat(3*nc*nv); dJv_nc(3*nc)]
-  //    H_flat / g_obj  : weighted task cost matrices (computed per step)
-  //    J_nc_flat       : contact Jacobian, 3*nc×nv, column-major;
-  //                      swing-foot rows are zero so their constraint degenerates to 0=0
-  //    dJv_nc          : Jdot * v bias for no-contact-motion, also zeroed for swing feet
-  ADScalar cs_q      = ADScalar::sym("q",        nq);
-  ADScalar cs_v      = ADScalar::sym("v",        nv);
-  ADScalar cs_H_flat = ADScalar::sym("H_flat",   nu * nu);
-  ADScalar cs_g_obj  = ADScalar::sym("g_obj",    nu);
-  ADScalar cs_J_nc_flat = ADScalar::sym("J_nc_flat", 3 * nc * nv);
-  ADScalar cs_dJv_nc    = ADScalar::sym("dJv_nc",    3 * nc);
-  ADScalar cs_p = ADScalar::vertcat({cs_q, cs_v, cs_H_flat, cs_g_obj,
-                                     cs_J_nc_flat, cs_dJv_nc});
-
-  // ── NLP decision variables: u = [a(nv), Fc(3*nc), tau_j(nj)]
-  ADScalar cs_u   = ADScalar::sym("u",  nu);
-  ADScalar cs_a   = cs_u(casadi::Slice(0, nv));
-  ADScalar cs_fc  = cs_u(casadi::Slice(nv, nv + 3 * nc));
-  ADScalar cs_tau = cs_u(casadi::Slice(nv + 3 * nc, nu));
-
-  // ── Map CasADi symbolic columns → Eigen vectors so pinocchio can consume them
-  ADVec q_ad(nq), v_ad(nv), a_ad(nv);
-  q_ad = Eigen::Map<ADVec>(static_cast<std::vector<ADScalar>>(cs_q).data(), nq, 1);
-  v_ad = Eigen::Map<ADVec>(static_cast<std::vector<ADScalar>>(cs_v).data(), nv, 1);
-  a_ad = Eigen::Map<ADVec>(static_cast<std::vector<ADScalar>>(cs_a).data(), nv, 1);
-
-  // ── Forward kinematics: populates oMi (joint placements) and oMf (frame placements)
-  pinocchio::forwardKinematics(ad_model, ad_data, q_ad);
-  pinocchio::updateFramePlacements(ad_model, ad_data);
-
-  // ── Build f_ext: external wrench on each joint expressed in joint local frame.
-  //    Contact forces Fc are in world frame; the transformation is:
-  //      f_local = R_world_joint^T * f_world
-  //    where R_world_joint = ad_data.oMi[joint_id].rotation().
-  pinocchio::container::aligned_vector<ADForce> f_ext(
-      static_cast<size_t>(ad_model.njoints), ADForce::Zero());
-
-  for (int i = 0; i < nc; i++) {
-    const auto frame_idx = info_.endEffectorFrameIndices[i];
-    const auto joint_id  = ad_model.frames[frame_idx].parent;
-
-    // Symbolic rotation of joint frame in world frame (3×3)
-    const ADMat3 R = ad_data.oMi[joint_id].rotation();
-
-    // Contact force for foot i in world frame
-    ADVec3 fc_world;
-    for (int k = 0; k < 3; k++) fc_world(k) = cs_fc(3 * i + k);
-
-    // Point contact → linear force only, no torque at contact
-    f_ext[joint_id].linear()  = R.transpose() * fc_world;
-
-    ADVec3 r_world = ad_data.oMf[frame_idx].translation() - ad_data.oMi[joint_id].translation();
-    ADVec3 r_local = R.transpose() * r_world;
-    f_ext[joint_id].angular() = r_local.cross(R.transpose() * fc_world);
-  }
-
-  // ── Symbolic RNEA: tau_rnea = M*a + C(q,v) - g(q) - J^T * f_ext
-  //    Result is stored in ad_data.tau (Eigen vector of ADScalar, size nv).
-  pinocchio::rnea(ad_model, ad_data, q_ad, v_ad, a_ad, f_ext);
-
-  ADScalar cs_tau_rnea(nv, 1);
-  pinocchio::casadi::copy(ad_data.tau, cs_tau_rnea);
-
-  // ── No-contact-motion: J_nc * a + dJv_nc = 0
-  //    Swing-foot rows of J_nc_flat are zero, so their rows degenerate to 0 = 0.
-  ADScalar cs_J_nc_mat = ADScalar::reshape(cs_J_nc_flat, 3 * nc, nv);
-  ADScalar cs_nc_res   = ADScalar::mtimes(cs_J_nc_mat, cs_a) + cs_dJv_nc;
-
-  // ── Friction cone: mu² * Fc_z² - Fc_x² - Fc_y² >= 0  (one per foot)
-  //    Swing feet are already fixed to Fc=0 by box constraints, so the
-  //    constraint degenerates to 0 >= 0 and causes no numerical issue.
+  const int nq  = model.nq;
+  const int nv  = model.nv;
+  const int nj  = static_cast<int>(info_.actuatedDofNum);
+  const int nc  = static_cast<int>(info_.numThreeDofContacts);
+  const int nu_full = nv + 3 * nc + nj;  // k < tauNodes_: [a(nv), Fc(3*nc), τ_j(nj)]
+  const int nu_red  = nv + 3 * nc;       // k ≥ tauNodes_: [a(nv), Fc(3*nc)]
+  const int nu      = nu_full;           // alias for parameter-vector sizing (always full)
+  const int ndx     = 2 * nv;           // delta state: [δq(nv), δv(nv)]
+  const int N       = numNodes_;
   const double mu = frictionCoeff_;
-  std::vector<ADScalar> friction_exprs;
-  friction_exprs.reserve(nc);
-  for (int i = 0; i < nc; i++) {
-    ADScalar Fc_x = cs_fc(3 * i);
-    ADScalar Fc_y = cs_fc(3 * i + 1);
-    ADScalar Fc_z = cs_fc(3 * i + 2);
-    friction_exprs.push_back(mu * mu * Fc_z * Fc_z - Fc_x * Fc_x - Fc_y * Fc_y);
+
+  // ── Precompute geometric time steps: δt_k = γ^k * δt_0
+  //    Σ δt_k = δt_0 * (γ^N − 1)/(γ−1) = T_total  →  δt_0 solved analytically
+  dts_.resize(N);
+  {
+    double dt0;
+    if (std::abs(gamma_ - 1.0) < 1e-9)
+        dt0 = totalHorizon_ / N;
+    else
+        dt0 = totalHorizon_ * (gamma_ - 1.0) / (std::pow(gamma_, N) - 1.0);
   }
-  ADScalar cs_friction = ADScalar::vertcat(friction_exprs);
 
-  // ── Constraints g:
-  //    [0 : 6]            equality  — floating base: tau_rnea = 0
-  //    [6 : nv]           equality  — actuated joints: tau_rnea = tau_j
-  //    [nv : nv+3*nc]     equality  — contact: J_nc * a = -dJv_nc
-  //    [nv+3*nc : ...]    inequality (>= 0) — friction cone per foot
-  ADScalar cs_g = ADScalar::vertcat({
-      cs_tau_rnea(casadi::Slice(0, 6)),
-      cs_tau_rnea(casadi::Slice(6, nv)) - cs_tau,
-      cs_nc_res,
-      cs_friction
-  });
+  // ── Parameter vector layout:
+  //    [q0(nq), v0(nv),  <node-0-params>, ..., <node-(N-1)-params>]
+  //    per-node: [H_flat(nu²), g_obj(nu), J_nc_flat(3*nc*nv), dJv_nc(3*nc)]
+  //    (δt_k are baked as numeric constants — no need to pass them at each solve)
+  const int p_node  = nu * nu + nu + 3 * nc * nv + 3 * nc;
+  const int p_total = nq + nv + N * p_node;
+  ADScalar cs_p = ADScalar::sym("p", p_total);
 
-  // Weighted task objective: 0.5 * u^T * H * u + g_obj^T * u
-  // H and g_obj are numeric parameters computed per time-step from the task Jacobians.
-  // A small regularization term keeps the Hessian positive-definite when H is rank-deficient.
-  ADScalar cs_H_mat = ADScalar::reshape(cs_H_flat, nu, nu);
-  ADScalar obj = 0.5 * ADScalar::dot(cs_u, ADScalar::mtimes(cs_H_mat, cs_u))
-               + ADScalar::dot(cs_g_obj, cs_u)
-               + 1e-6 * ADScalar::dot(cs_u, cs_u);
+  int p_off = 0;
+  ADScalar cs_q0 = cs_p(casadi::Slice(p_off, p_off + nq)); p_off += nq;
+  ADScalar cs_v0 = cs_p(casadi::Slice(p_off, p_off + nv)); p_off += nv;
 
-  casadi::SXDict nlp = {{"x", cs_u}, {"f", obj}, {"g", cs_g}, {"p", cs_p}};
+  std::vector<ADScalar> cs_H_flat(N), cs_g_obj(N), cs_J_nc_flat(N), cs_dJv_nc(N);
+  for (int k = 0; k < N; k++) {
+    cs_H_flat[k]    = cs_p(casadi::Slice(p_off, p_off + nu * nu));      p_off += nu * nu;
+    cs_g_obj[k]     = cs_p(casadi::Slice(p_off, p_off + nu));           p_off += nu;
+    cs_J_nc_flat[k] = cs_p(casadi::Slice(p_off, p_off + 3 * nc * nv)); p_off += 3 * nc * nv;
+    cs_dJv_nc[k]    = cs_p(casadi::Slice(p_off, p_off + 3 * nc));      p_off += 3 * nc;
+  }
+
+  // ── Decision variable layout:
+  //    k < tauNodes_ : U[k] = [a(nv), Fc(3*nc), τ_j(nj)]  size nu_full
+  //    k ≥ tauNodes_ : U[k] = [a(nv), Fc(3*nc)]            size nu_red
+  //    DX[k] = [δq(nv), δv(nv)]                            size ndx  (DX[0]=0)
+  // Use per-node loop (mirrors U[k] extraction) — correct even when N < tauNodes_
+  nz_ = std::min(N, tauNodes_) * (nu_full + ndx)
+      + std::max(0, N - tauNodes_) * (nu_red + ndx);
+  ADScalar cs_z = ADScalar::sym("z", nz_);
+
+  std::vector<ADScalar> U(N), DX(N + 1);
+  DX[0] = ADScalar::zeros(ndx, 1);
+  int z_off = 0;
+  for (int k = 0; k < N; k++) {
+    const int nu_k = (k < tauNodes_) ? nu_full : nu_red;
+    U[k]    = cs_z(casadi::Slice(z_off, z_off + nu_k));  z_off += nu_k;
+    DX[k+1] = cs_z(casadi::Slice(z_off, z_off + ndx));   z_off += ndx;
+  }
+
+  // ── Map q0, v0 to Eigen so pinocchio can integrate from them
+  ADVec q0_ad(nq), v0_ad(nv);
+  for (int i = 0; i < nq; i++) q0_ad(i) = cs_q0(i);
+  for (int i = 0; i < nv; i++) v0_ad(i) = cs_v0(i);
+
+  // ── Build NLP per shooting node
+  ADScalar obj = ADScalar::zeros(1);
+  std::vector<ADScalar> g_list;
+  g_list.reserve(N);
+
+  // ── FK at q0 once; all nodes linearise dynamics at the measured configuration.
+  //    pinocchio::integrate is intentionally avoided — it triggers boost::bad_get
+  //    via boost::variant dispatch when used with CasADi ADScalar joint types.
+  ADData ad_data_fk(ad_model);
+  pinocchio::forwardKinematics(ad_model, ad_data_fk, q0_ad);
+  pinocchio::updateFramePlacements(ad_model, ad_data_fk);
+
+  for (int k = 0; k < N; k++) {
+    // Extract delta state at node k: DX[k] = [δq_k(nv), δv_k(nv)]
+    ADScalar dq_k = DX[k](casadi::Slice(0, nv));   // (nv×1) — used only in shooting gap
+    ADScalar dv_k = DX[k](casadi::Slice(nv, ndx)); // (nv×1) — feeds absolute v_k
+
+    // ── Absolute velocity: v_k = v0 + δv_k
+    ADVec v_k_ad(nv);
+    for (int i = 0; i < nv; i++) v_k_ad(i) = v0_ad(i) + dv_k(i);
+
+    // ── Extract inputs at node k (τ_j only for tau nodes)
+    ADScalar cs_a_k  = U[k](casadi::Slice(0, nv));
+    ADScalar cs_fc_k = U[k](casadi::Slice(nv, nv + 3 * nc));
+    ADVec a_k_ad(nv);
+    for (int i = 0; i < nv; i++) a_k_ad(i) = cs_a_k(i);
+
+    // ── External wrenches at q0 (frozen linearisation point)
+    pinocchio::container::aligned_vector<ADForce> f_ext(
+        static_cast<size_t>(ad_model.njoints), ADForce::Zero());
+    for (int i = 0; i < nc; i++) {
+      const auto frame_idx = info_.endEffectorFrameIndices[i];
+      const auto joint_id  = ad_model.frames[frame_idx].parent;
+      const ADMat3 R = ad_data_fk.oMi[joint_id].rotation();
+      ADVec3 fc_world;
+      for (int j = 0; j < 3; j++) fc_world(j) = cs_fc_k(3 * i + j);
+      f_ext[joint_id].linear()  = R.transpose() * fc_world;
+      ADVec3 r_world = ad_data_fk.oMf[frame_idx].translation() - ad_data_fk.oMi[joint_id].translation();
+      ADVec3 r_local = R.transpose() * r_world;
+      f_ext[joint_id].angular() = r_local.cross(R.transpose() * fc_world);
+    }
+
+    // ── RNEA at (q0, v_k, a_k)
+    ADData ad_data(ad_model);
+    pinocchio::rnea(ad_model, ad_data, q0_ad, v_k_ad, a_k_ad, f_ext);
+    ADScalar cs_tau_rnea(nv, 1);
+    pinocchio::casadi::copy(ad_data.tau, cs_tau_rnea);
+
+    // ── No-contact-motion: J_nc_k * a_k + dJv_nc_k = 0
+    ADScalar cs_J_nc_mat = ADScalar::reshape(cs_J_nc_flat[k], 3 * nc, nv);
+    ADScalar cs_nc_res   = ADScalar::mtimes(cs_J_nc_mat, cs_a_k) + cs_dJv_nc[k];
+
+    // ── Friction cone: mu²*Fz² - Fx² - Fy² >= 0
+    std::vector<ADScalar> frict;
+    frict.reserve(nc);
+    for (int i = 0; i < nc; i++) {
+      ADScalar Fx = cs_fc_k(3 * i), Fy = cs_fc_k(3 * i + 1), Fz = cs_fc_k(3 * i + 2);
+      frict.push_back(mu * mu * Fz * Fz - Fx * Fx - Fy * Fy);
+    }
+    ADScalar cs_friction_k = ADScalar::vertcat(frict);
+
+    // ── Shooting gap: DX[k+1] = DX[k] + [v_k·δt_k ; a_k·δt_k]
+    //    δt_k is baked in as a numeric constant (geometric schedule)
+    //    v_k in CasADi: cs_v0 + dv_k  (avoids Eigen round-trip)
+    const double dt_k = dts_[k];
+    ADScalar v_k_cs  = cs_v0 + dv_k;                                    // (nv×1)
+    ADScalar dq_pred = dq_k + v_k_cs * dt_k;                            // (nv×1)
+    ADScalar dv_pred = dv_k + cs_a_k * dt_k;                            // (nv×1)
+    ADScalar gap     = DX[k+1] - ADScalar::vertcat({dq_pred, dv_pred}); // (ndx×1)
+
+    // ── Joint RNEA constraint (tauNodes_-aware)
+    //    k < tauNodes_ : τ_rnea[6:] == τ_j  (τ_j is a decision variable)
+    //    k ≥ tauNodes_ : τ_rnea[6:] == 0    (no torque variable at reduced nodes)
+    ADScalar joint_eq = (k < tauNodes_)
+        ? cs_tau_rnea(casadi::Slice(6, nv)) - U[k](casadi::Slice(nv + 3 * nc, nu_full))
+        : cs_tau_rnea(casadi::Slice(6, nv));
+
+    g_list.push_back(gap);
+    g_list.push_back(cs_tau_rnea(casadi::Slice(0, 6)));
+    g_list.push_back(joint_eq);
+    g_list.push_back(cs_nc_res);
+    g_list.push_back(cs_friction_k);
+
+    // ── Objective (tauNodes_-aware)
+    //    k < tauNodes_ : full H (nu_full × nu_full)
+    //    k ≥ tauNodes_ : top-left nu_red × nu_red block (τ_j columns dropped)
+    ADScalar cs_H_full = ADScalar::reshape(cs_H_flat[k], nu_full, nu_full);
+    if (k < tauNodes_) {
+      obj += 0.5 * ADScalar::dot(U[k], ADScalar::mtimes(cs_H_full, U[k]))
+           + ADScalar::dot(cs_g_obj[k], U[k])
+           + 1e-6 * ADScalar::dot(U[k], U[k]);
+    } else {
+      ADScalar cs_H_red = cs_H_full(casadi::Slice(0, nu_red), casadi::Slice(0, nu_red));
+      ADScalar cs_g_red = cs_g_obj[k](casadi::Slice(0, nu_red));
+      obj += 0.5 * ADScalar::dot(U[k], ADScalar::mtimes(cs_H_red, U[k]))
+           + ADScalar::dot(cs_g_red, U[k])
+           + 1e-6 * ADScalar::dot(U[k], U[k]);
+    }
+  }
+
+  ADScalar cs_g = ADScalar::vertcat(g_list);
+
+  casadi::SXDict nlp = {{"x", cs_z}, {"f", obj}, {"g", cs_g}, {"p", cs_p}};
   casadi::Dict opts = {
       {"print_time", false},
       {"ipopt.print_level", 0},
-      {"ipopt.max_iter", 50},
+      {"ipopt.max_iter", 100},
       {"ipopt.warm_start_init_point", "yes"},
       {"ipopt.warm_start_bound_push", 1e-9},
       {"ipopt.warm_start_bound_frac", 1e-9},
@@ -154,7 +211,7 @@ void RneaWbc::buildNlp() {
       {"ipopt.warm_start_slack_bound_push", 1e-9},
       {"ipopt.warm_start_mult_bound_push", 1e-9},
   };
-  nlpSolver_ = casadi::nlpsol("wbc_rnea", "ipopt", nlp, opts);
+  nlpSolver_ = casadi::nlpsol("wbc_rnea_mpc", "ipopt", nlp, opts);
 }
 
 Task RneaWbc::formulateWeightedTasks(const vector_t& stateDesired, const vector_t& inputDesired,
@@ -169,18 +226,21 @@ vector_t RneaWbc::solveNlp(const vector_t& q, const vector_t& v,
                            const vector_t& stateDesired,
                            const vector_t& inputDesired,
                            scalar_t period) {
-  const int nq = static_cast<int>(q.size());
-  const int nv = static_cast<int>(v.size());
-  const int nj = static_cast<int>(info_.actuatedDofNum);
-  const int nc = static_cast<int>(info_.numThreeDofContacts);
-  const int nu = nv + 3 * nc + nj;
+  const int nq      = static_cast<int>(q.size());
+  const int nv      = static_cast<int>(v.size());
+  const int nj      = static_cast<int>(info_.actuatedDofNum);
+  const int nc      = static_cast<int>(info_.numThreeDofContacts);
+  const int nu_full = nv + 3 * nc + nj;
+  const int nu_red  = nv + 3 * nc;
+  const int nu      = nu_full;  // alias for parameter-vector sizing
+  const int ndx     = 2 * nv;
+  const int N       = numNodes_;
 
+  // ── Task matrices (same for all nodes — refine per-node if MPC provides a trajectory)
   Task task = formulateWeightedTasks(stateDesired, inputDesired, period);
   matrix_t H_task = task.a_.transpose() * task.a_;
   vector_t g_task = -(task.a_.transpose() * task.b_);
 
-  // No-contact-motion: J_nc * a = -dJv_nc
-  // Swing-foot rows are zeroed so their constraint is trivially 0 = 0.
   matrix_t J_nc   = matrix_t::Zero(3 * nc, nv);
   vector_t dJv_nc = vector_t::Zero(3 * nc);
   for (int i = 0; i < nc; i++) {
@@ -190,73 +250,99 @@ vector_t RneaWbc::solveNlp(const vector_t& q, const vector_t& v,
     }
   }
 
-  // Pack NLP parameters: p = [q; v; H_flat; g_obj; J_nc_flat; dJv_nc]
-  // All matrices use column-major order (Eigen default == CasADi reshape default)
-  const int p_size = nq + nv + nu * nu + nu + 3 * nc * nv + 3 * nc;
-  casadi::DM p_dm(p_size, 1);
+  // ── Pack parameter vector: [q0, v0, per-node x N]
+  //    δt_k are baked into the NLP graph — not passed here
+  const int p_node  = nu * nu + nu + 3 * nc * nv + 3 * nc;
+  const int p_total = nq + nv + N * p_node;
+  casadi::DM p_dm(p_total, 1);
   int off = 0;
-  for (int i = 0; i < nq; i++)       p_dm(off++)  = q(i);
-  for (int i = 0; i < nv; i++)       p_dm(off++)  = v(i);
-  for (int i = 0; i < nu * nu; i++)  p_dm(off++)  = H_task.data()[i];
-  for (int i = 0; i < nu; i++)       p_dm(off++)  = g_task(i);
-  for (int i = 0; i < 3*nc*nv; i++) p_dm(off++)  = J_nc.data()[i];
-  for (int i = 0; i < 3*nc; i++)    p_dm(off++)  = dJv_nc(i);
-
-  // Equality bounds: RNEA (6+nj rows) + no-contact-motion (3*nc rows), all = 0
-  // Inequality bounds: friction cone (nc rows) in [0, +inf)
-  const int n_eq   = 6 + nj + 3 * nc;
-  const int n_ineq = nc;
-  casadi::DM lbg = casadi::DM::zeros(n_eq + n_ineq, 1);
-  casadi::DM ubg = casadi::DM::zeros(n_eq + n_ineq, 1);
-  for (int i = 0; i < n_ineq; i++) ubg(n_eq + i) = 1e20;
-
-  // Box constraints on u
-  casadi::DM lbu = -1e9 * casadi::DM::ones(nu, 1);
-  casadi::DM ubu =  1e9 * casadi::DM::ones(nu, 1);
-
-  // Torque limits
-  const int lim_size = static_cast<int>(torqueLimits_.size());
-  for (int j = 0; j < nj; j++) {
-    const double lim = torqueLimits_(j % lim_size);
-    lbu(nv + 3 * nc + j) = -lim;
-    ubu(nv + 3 * nc + j) =  lim;
+  for (int i = 0; i < nq; i++)      p_dm(off++) = q(i);
+  for (int i = 0; i < nv; i++)      p_dm(off++) = v(i);
+  for (int k = 0; k < N; k++) {
+    for (int i = 0; i < nu * nu; i++) p_dm(off++) = H_task.data()[i];
+    for (int i = 0; i < nu; i++)      p_dm(off++) = g_task(i);
+    for (int i = 0; i < 3*nc*nv; i++) p_dm(off++) = J_nc.data()[i];
+    for (int i = 0; i < 3*nc; i++)    p_dm(off++) = dJv_nc(i);
   }
-  // Contact force feasibility:
-  //   contact foot → normal force must be upward (Fc_z >= 0)
-  //   swing foot   → zero force (Fc = 0)
-  for (int i = 0; i < nc; i++) {
-    if (contactFlag[i]) {
-      lbu(nv + 3 * i + 2) = 0.0;   // Fc_z >= 0
-    } else {
-      lbu(nv + 3 * i)     = 0.0;  ubu(nv + 3 * i)     = 0.0;
-      lbu(nv + 3 * i + 1) = 0.0;  ubu(nv + 3 * i + 1) = 0.0;
-      lbu(nv + 3 * i + 2) = 0.0;  ubu(nv + 3 * i + 2) = 0.0;
+
+  // ── Constraint bounds
+  // Per node (in g_list order): gap(ndx eq) + RNEA-base(6 eq) + RNEA-joints(nj eq)
+  //                             + contact(3*nc eq) + friction(nc ineq)
+  const int n_eq_per   = ndx + nv + 3 * nc;   // ndx + 6 + nj + 3*nc = 2nv+nv+3nc
+  const int n_ineq_per = nc;
+  const int n_per      = n_eq_per + n_ineq_per;
+  casadi::DM lbg = casadi::DM::zeros(N * n_per, 1);
+  casadi::DM ubg = casadi::DM::zeros(N * n_per, 1);
+  for (int k = 0; k < N; k++) {
+    const int friction_off = k * n_per + n_eq_per;
+    for (int i = 0; i < n_ineq_per; i++) ubg(friction_off + i) = 1e20;
+  }
+  // For k >= tauNodes_: τ_j is not a decision variable, so relax the joint torque equality
+  // to an actuator-limit inequality |tau_rnea[6:nv]| <= lim instead of forcing it to zero.
+  // Offset within each node's constraint block: gap(ndx) + base(6) = ndx+6
+  {
+    const int lim_sz = static_cast<int>(torqueLimits_.size());
+    for (int k = tauNodes_; k < N; k++) {
+      const int joint_off = k * n_per + ndx + 6;
+      for (int j = 0; j < nj; j++) {
+        const double lim = torqueLimits_(j % lim_sz);
+        lbg(joint_off + j) = -lim;
+        ubg(joint_off + j) =  lim;
+      }
     }
   }
 
-  casadi::DMDict args = {{"lbg", lbg}, {"ubg", ubg}, {"lbx", lbu}, {"ubx", ubu}, {"p", p_dm}};
+  // ── Decision variable box constraints: z = [U[0], DX[1], U[1], DX[2], ..., U[N-1], DX[N]]
+  casadi::DM lbz = -1e9 * casadi::DM::ones(nz_, 1);
+  casadi::DM ubz =  1e9 * casadi::DM::ones(nz_, 1);
+
+  const int lim_size = static_cast<int>(torqueLimits_.size());
+  int z_off = 0;
+  for (int k = 0; k < N; k++) {
+    const int nu_k = (k < tauNodes_) ? nu_full : nu_red;
+
+    // Torque limits: only for tau nodes
+    if (k < tauNodes_) {
+      for (int j = 0; j < nj; j++) {
+        const double lim = torqueLimits_(j % lim_size);
+        lbz(z_off + nv + 3 * nc + j) = -lim;
+        ubz(z_off + nv + 3 * nc + j) =  lim;
+      }
+    }
+    // Force feasibility: contact Fc_z >= 0; swing Fc = 0
+    for (int i = 0; i < nc; i++) {
+      if (contactFlag[i]) {
+        lbz(z_off + nv + 3 * i + 2) = 0.0;
+      } else {
+        lbz(z_off + nv + 3*i)   = 0.0; ubz(z_off + nv + 3*i)   = 0.0;
+        lbz(z_off + nv + 3*i+1) = 0.0; ubz(z_off + nv + 3*i+1) = 0.0;
+        lbz(z_off + nv + 3*i+2) = 0.0; ubz(z_off + nv + 3*i+2) = 0.0;
+      }
+    }
+    z_off += nu_k;
+    z_off += ndx;  // skip DX[k+1] (unbounded)
+  }
+
+  // ── Solve
+  casadi::DMDict args = {{"lbg", lbg}, {"ubg", ubg}, {"lbx", lbz}, {"ubx", ubz}, {"p", p_dm}};
   if (hasWarmStart_) {
-    // Full warm-start: primal + dual variables from a previous successful solve
     args["x0"]     = prevX_;
     args["lam_g0"] = prevLamG_;
     args["lam_x0"] = prevLamX_;
   } else if (hasExternalGuess_) {
-    // Primal-only hint from WeightedWbc — no dual variables available,
-    // but far better than starting from zero.
     args["x0"] = prevX_;
   } else {
-    args["x0"] = casadi::DM::zeros(nu, 1);
+    args["x0"] = casadi::DM::zeros(nz_, 1);
   }
 
   casadi::DMDict sol = nlpSolver_(args);
 
-  // ── Solver diagnostics (throttled to 1 Hz) ─────────────────────────────
-  const auto& stats       = nlpSolver_.stats();
+  // ── Diagnostics (throttled to 1 Hz)
+  const auto& stats        = nlpSolver_.stats();
   const std::string status = stats.at("return_status");
-  const int    iters      = static_cast<int>(stats.at("iter_count"));
-  const double obj        = static_cast<double>(casadi::DM(sol.at("f")));
+  const int    iters       = static_cast<int>(stats.at("iter_count"));
+  const double obj_val     = static_cast<double>(casadi::DM(sol.at("f")));
 
-  // RNEA equality residual: g should be zero; report L-inf norm
   casadi::DM g_val = sol.at("g");
   double g_inf = 0.0;
   for (int i = 0; i < g_val.size1(); i++)
@@ -265,37 +351,46 @@ vector_t RneaWbc::solveNlp(const vector_t& q, const vector_t& v,
   if (status != "Solve_Succeeded" && status != "Solved_To_Acceptable_Level") {
     ROS_WARN_STREAM_THROTTLE(1.0,
         "[RneaWbc] IPOPT status: " << status
-        << "  iters=" << iters << "  obj=" << obj
-        << "  |g|_inf=" << g_inf);
+        << "  iters=" << iters << "  obj=" << obj_val << "  |g|_inf=" << g_inf);
   } else {
     ROS_INFO_STREAM_THROTTLE(1.0,
         "[RneaWbc] IPOPT status: " << status
-        << "  iters=" << iters << "  obj=" << obj
-        << "  |g|_inf=" << g_inf);
+        << "  iters=" << iters << "  obj=" << obj_val << "  |g|_inf=" << g_inf);
   }
-  // ───────────────────────────────────────────────────────────────────────
 
   if (status == "Solve_Succeeded" || status == "Solved_To_Acceptable_Level") {
-    // Good solve: save full primal + dual for next iteration
-    prevX_        = sol.at("x");
-    prevLamG_     = sol.at("lam_g");
-    prevLamX_     = sol.at("lam_x");
+    prevX_            = sol.at("x");
+    prevLamG_         = sol.at("lam_g");
+    prevLamX_         = sol.at("lam_x");
     hasWarmStart_     = true;
     hasExternalGuess_ = false;
   } else {
-    // Bad solve: discard this result, fall back to external guess next time
-    prevX_ = sol.at("x");
+    prevX_        = sol.at("x");
     hasWarmStart_ = false;
   }
 
+  // Return U[0] — the first-node input is the WBC command applied to the robot
   vector_t result(nu);
   for (int i = 0; i < nu; i++) result(i) = static_cast<double>(prevX_(i));
+
+  // ── Diagnostic: contactFlag + τ_j per leg (throttled to 1 Hz)
+  {
+    std::string cf_str;
+    for (int i = 0; i < nc; i++) cf_str += contactFlag[i] ? "1" : "0";
+    const vector_t tau_j = result.tail(nj);
+    ROS_DEBUG_STREAM_THROTTLE(1.0,
+        "[RneaWbc] contactFlag=" << cf_str
+        << "  tau_j=" << tau_j.transpose().format(
+               Eigen::IOFormat(3, 0, " ", " ")));
+  }
+
   return result;
 }
 
 void RneaWbc::setExternalInitialGuess(const vector_t& u0) {
+  // nz_ = N*(nu+ndx); place the single-node guess into U[0] and leave the rest zero
+  prevX_ = casadi::DM::zeros(nz_, 1);
   const int nu = static_cast<int>(u0.size());
-  prevX_ = casadi::DM(nu, 1);
   for (int i = 0; i < nu; i++) prevX_(i) = u0(i);
   hasExternalGuess_ = true;
 }
@@ -313,6 +408,17 @@ void RneaWbc::loadTasksSetting(const std::string& taskFile, bool verbose) {
   loadData::loadPtreeValue(pt, weightSwingLeg_,     prefix + "swingLeg",     verbose);
   loadData::loadPtreeValue(pt, weightBaseAccel_,    prefix + "baseAccel",    verbose);
   loadData::loadPtreeValue(pt, weightContactForce_, prefix + "contactForce", verbose);
+
+  prefix = "rneaWbc.";
+  if (verbose) {
+    std::cerr << "\n #### RneaWbc planning:";
+    std::cerr << "\n #### =============================================================================\n";
+  }
+  loadData::loadPtreeValue(pt, numNodes_,     prefix + "numNodes",     verbose);
+  loadData::loadPtreeValue(pt, tauNodes_,     prefix + "tauNodes",     verbose);
+  loadData::loadPtreeValue(pt, gamma_,        prefix + "gamma",        verbose);
+  loadData::loadPtreeValue(pt, totalHorizon_, prefix + "totalHorizon", verbose);
+  tauNodes_ = std::min(tauNodes_, numNodes_);  // guard: tauNodes ≤ numNodes
 
   buildNlp();
 }
