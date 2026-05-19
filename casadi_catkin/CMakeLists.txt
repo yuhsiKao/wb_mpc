@@ -23,6 +23,15 @@ ExternalProject_Add(casadi_external
     # Enable IPOPT (already installed system-wide)
     -DWITH_IPOPT=ON
     -DWITH_BUILD_IPOPT=OFF
+    # Enable Fatrop — use the pre-built fatrop v0.0.4 at /opt/fatrop_v004.
+    # Built from meco-group/fatrop v0.0.4 with system GCC 9.4 so GLIBCXX is
+    # compatible (max GLIBCXX_3.4.21). blasfeo is bundled statically inside.
+    -DWITH_FATROP=ON
+    -DWITH_BUILD_FATROP=OFF
+    -DCMAKE_PREFIX_PATH=/opt/fatrop_v004
+    # Embed RPATH so libfatrop.so is found at runtime without LD_LIBRARY_PATH.
+    -DCMAKE_INSTALL_RPATH=/opt/fatrop_v004/lib
+    -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON
     # Disable all language front-ends and tests
     -DWITH_PYTHON=OFF
     -DWITH_MATLAB=OFF

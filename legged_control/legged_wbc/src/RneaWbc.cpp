@@ -52,6 +52,8 @@ void RneaWbc::buildNlp() {
         dt0 = totalHorizon_ / N;
     else
         dt0 = totalHorizon_ * (gamma_ - 1.0) / (std::pow(gamma_, N) - 1.0);
+    for (int k = 0; k < N; k++)
+        dts_[k] = dt0 * std::pow(gamma_, k);
   }
 
   // ── Parameter vector layout:
@@ -74,18 +76,22 @@ void RneaWbc::buildNlp() {
     cs_dJv_nc[k]    = cs_p(casadi::Slice(p_off, p_off + 3 * nc));      p_off += 3 * nc;
   }
 
-  // ── Decision variable layout:
+  // ── Decision variable layout (Fatrop stage-wise interleaved):
+  //    z = [DX[0](ndx), U[0](nu_0), DX[1](ndx), U[1](nu_1), ..., U[N-1](nu_{N-1}), DX[N](ndx)]
   //    k < tauNodes_ : U[k] = [a(nv), Fc(3*nc), τ_j(nj)]  size nu_full
   //    k ≥ tauNodes_ : U[k] = [a(nv), Fc(3*nc)]            size nu_red
-  //    DX[k] = [δq(nv), δv(nv)]                            size ndx  (DX[0]=0)
-  // Use per-node loop (mirrors U[k] extraction) — correct even when N < tauNodes_
-  nz_ = std::min(N, tauNodes_) * (nu_full + ndx)
-      + std::max(0, N - tauNodes_) * (nu_red + ndx);
+  //    DX[k] = [δq(nv), δv(nv)]                            size ndx
+  //    DX[0] is included as a decision variable and pinned to 0 via box constraints
+  //    in solveNlp(), giving Fatrop a clean [state, control] pair at every stage.
+  ndx_ = ndx;
+  nz_ = (N + 1) * ndx
+      + std::min(N, tauNodes_) * nu_full
+      + std::max(0, N - tauNodes_) * nu_red;
   ADScalar cs_z = ADScalar::sym("z", nz_);
 
   std::vector<ADScalar> U(N), DX(N + 1);
-  DX[0] = ADScalar::zeros(ndx, 1);
   int z_off = 0;
+  DX[0] = cs_z(casadi::Slice(z_off, z_off + ndx));  z_off += ndx;  // pinned to 0 at solve time
   for (int k = 0; k < N; k++) {
     const int nu_k = (k < tauNodes_) ? nu_full : nu_red;
     U[k]    = cs_z(casadi::Slice(z_off, z_off + nu_k));  z_off += nu_k;
@@ -199,19 +205,36 @@ void RneaWbc::buildNlp() {
 
   ADScalar cs_g = ADScalar::vertcat(g_list);
 
+  // ── Fatrop structure: every stage has ndx states; controls and lincon may vary per stage.
+  //    nx  : state sizes,  length N+1 (terminal stage is DX[N], no controls)
+  //    nu  : control sizes, length N+1 (terminal entry = 0 by CasADi 3.6 convention)
+  //    ng  : non-dynamic constraint count per stage, length N+1
+  //          gap constraints (ndx rows each) are detected automatically from the structure.
+  //          lincon per stage = RNEA(nv) + contact(3*nc) + friction(nc) = nv + 4*nc
+  const int ng_stage = nv + 4 * nc;
+  std::vector<casadi_int> nx_v(N + 1, ndx);
+  std::vector<casadi_int> nu_v(N + 1, 0);
+  std::vector<casadi_int> ng_v(N + 1, 0);
+  for (int k = 0; k < N; k++) {
+    nu_v[k] = (k < tauNodes_) ? nu_full : nu_red;
+    ng_v[k] = ng_stage;
+  }
+
   casadi::SXDict nlp = {{"x", cs_z}, {"f", obj}, {"g", cs_g}, {"p", cs_p}};
+  casadi::Dict fatrop_opts;
+  fatrop_opts["print_level"] = casadi_int(0);
+  fatrop_opts["max_iter"]    = casadi_int(100);
   casadi::Dict opts = {
-      {"print_time", false},
-      {"ipopt.print_level", 0},
-      {"ipopt.max_iter", 100},
-      {"ipopt.warm_start_init_point", "yes"},
-      {"ipopt.warm_start_bound_push", 1e-9},
-      {"ipopt.warm_start_bound_frac", 1e-9},
-      {"ipopt.warm_start_slack_bound_frac", 1e-9},
-      {"ipopt.warm_start_slack_bound_push", 1e-9},
-      {"ipopt.warm_start_mult_bound_push", 1e-9},
+      {"print_time",          false},
+      {"expand",              false},  // must NOT expand: Fatrop relies on SX sparsity structure
+      {"structure_detection", std::string("manual")},
+      {"N",                   casadi_int(N)},
+      {"nx",                  nx_v},
+      {"nu",                  nu_v},
+      {"ng",                  ng_v},
+      {"fatrop",              fatrop_opts},
   };
-  nlpSolver_ = casadi::nlpsol("wbc_rnea_mpc", "ipopt", nlp, opts);
+  nlpSolver_ = casadi::nlpsol("wbc_rnea_mpc", "fatrop", nlp, opts);
 }
 
 Task RneaWbc::formulateWeightedTasks(const vector_t& stateDesired, const vector_t& inputDesired,
@@ -292,12 +315,15 @@ vector_t RneaWbc::solveNlp(const vector_t& q, const vector_t& v,
     }
   }
 
-  // ── Decision variable box constraints: z = [U[0], DX[1], U[1], DX[2], ..., U[N-1], DX[N]]
+  // ── Decision variable box constraints:
+  //    z = [DX[0](ndx), U[0](nu_0), DX[1](ndx), U[1](nu_1), ..., U[N-1](nu_{N-1}), DX[N](ndx)]
+  //    DX[0] is pinned to zero: it is the initial delta-state (always 0 at the current instant).
   casadi::DM lbz = -1e9 * casadi::DM::ones(nz_, 1);
   casadi::DM ubz =  1e9 * casadi::DM::ones(nz_, 1);
+  for (int i = 0; i < ndx; i++) { lbz(i) = 0.0; ubz(i) = 0.0; }
 
   const int lim_size = static_cast<int>(torqueLimits_.size());
-  int z_off = 0;
+  int z_off = ndx;  // skip DX[0]
   for (int k = 0; k < N; k++) {
     const int nu_k = (k < tauNodes_) ? nu_full : nu_red;
 
@@ -339,7 +365,7 @@ vector_t RneaWbc::solveNlp(const vector_t& q, const vector_t& v,
 
   // ── Diagnostics (throttled to 1 Hz)
   const auto& stats        = nlpSolver_.stats();
-  const std::string status = stats.at("return_status");
+  const std::string status = static_cast<std::string>(stats.at("unified_return_status"));
   const int    iters       = static_cast<int>(stats.at("iter_count"));
   const double obj_val     = static_cast<double>(casadi::DM(sol.at("f")));
 
@@ -348,17 +374,18 @@ vector_t RneaWbc::solveNlp(const vector_t& q, const vector_t& v,
   for (int i = 0; i < g_val.size1(); i++)
     g_inf = std::max(g_inf, std::abs(static_cast<double>(g_val(i))));
 
-  if (status != "Solve_Succeeded" && status != "Solved_To_Acceptable_Level") {
+  const bool solved_ok = (status == "SOLVER_RET_SUCCESS" || status == "SOLVER_RET_LIMITED");
+  if (!solved_ok) {
     ROS_WARN_STREAM_THROTTLE(1.0,
-        "[RneaWbc] IPOPT status: " << status
+        "[RneaWbc] Fatrop status: " << status
         << "  iters=" << iters << "  obj=" << obj_val << "  |g|_inf=" << g_inf);
   } else {
     ROS_INFO_STREAM_THROTTLE(1.0,
-        "[RneaWbc] IPOPT status: " << status
+        "[RneaWbc] Fatrop status: " << status
         << "  iters=" << iters << "  obj=" << obj_val << "  |g|_inf=" << g_inf);
   }
 
-  if (status == "Solve_Succeeded" || status == "Solved_To_Acceptable_Level") {
+  if (solved_ok) {
     prevX_            = sol.at("x");
     prevLamG_         = sol.at("lam_g");
     prevLamX_         = sol.at("lam_x");
@@ -369,9 +396,9 @@ vector_t RneaWbc::solveNlp(const vector_t& q, const vector_t& v,
     hasWarmStart_ = false;
   }
 
-  // Return U[0] — the first-node input is the WBC command applied to the robot
+  // Return U[0] — starts at offset ndx_ in the stage-wise layout [DX[0], U[0], ...]
   vector_t result(nu);
-  for (int i = 0; i < nu; i++) result(i) = static_cast<double>(prevX_(i));
+  for (int i = 0; i < nu; i++) result(i) = static_cast<double>(prevX_(ndx_ + i));
 
   // ── Diagnostic: contactFlag + τ_j per leg (throttled to 1 Hz)
   {
@@ -388,10 +415,10 @@ vector_t RneaWbc::solveNlp(const vector_t& q, const vector_t& v,
 }
 
 void RneaWbc::setExternalInitialGuess(const vector_t& u0) {
-  // nz_ = N*(nu+ndx); place the single-node guess into U[0] and leave the rest zero
+  // U[0] starts at offset ndx_ in the stage-wise layout [DX[0], U[0], ...]
   prevX_ = casadi::DM::zeros(nz_, 1);
   const int nu = static_cast<int>(u0.size());
-  for (int i = 0; i < nu; i++) prevX_(i) = u0(i);
+  for (int i = 0; i < nu; i++) prevX_(ndx_ + i) = u0(i);
   hasExternalGuess_ = true;
 }
 
@@ -414,11 +441,23 @@ void RneaWbc::loadTasksSetting(const std::string& taskFile, bool verbose) {
     std::cerr << "\n #### RneaWbc planning:";
     std::cerr << "\n #### =============================================================================\n";
   }
-  loadData::loadPtreeValue(pt, numNodes_,     prefix + "numNodes",     verbose);
-  loadData::loadPtreeValue(pt, tauNodes_,     prefix + "tauNodes",     verbose);
-  loadData::loadPtreeValue(pt, gamma_,        prefix + "gamma",        verbose);
-  loadData::loadPtreeValue(pt, totalHorizon_, prefix + "totalHorizon", verbose);
+  loadData::loadPtreeValue(pt, numNodes_, prefix + "numNodes", verbose);
+  loadData::loadPtreeValue(pt, tauNodes_, prefix + "tauNodes", verbose);
+  loadData::loadPtreeValue(pt, gamma_,    prefix + "gamma",    verbose);
   tauNodes_ = std::min(tauNodes_, numNodes_);  // guard: tauNodes ≤ numNodes
+
+  // Determine base dt: rneaWbc.dt takes priority; falls back to sqp.dt.
+  // totalHorizon = numNodes × dt; gamma controls adaptive spacing within it.
+  double wbc_dt = 0.015;
+  loadData::loadPtreeValue(pt, wbc_dt, "sqp.dt",         false);  // default from MPC
+  loadData::loadPtreeValue(pt, wbc_dt, prefix + "dt",    verbose); // override if set
+  totalHorizon_ = numNodes_ * wbc_dt;
+
+  if (verbose) {
+    std::cerr << " #### [RneaWbc] dt=" << wbc_dt
+              << "  totalHorizon=" << totalHorizon_
+              << "  gamma=" << gamma_ << "\n";
+  }
 
   buildNlp();
 }

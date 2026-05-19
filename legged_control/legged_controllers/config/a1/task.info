@@ -308,10 +308,11 @@ weight
 
 rneaWbc
 {
-    numNodes        2      ; number of shooting nodes (set to 1 for single-node / baseline)
-    tauNodes        1      ; nodes [0, tauNodes) include τ_j as decision var; must be ≤ numNodes
+    numNodes        10     ; number of shooting nodes (set to 1 for single-node / baseline)
+    tauNodes        2      ; nodes [0, tauNodes) include τ_j as decision var; must be ≤ numNodes
     gamma           1.2    ; geometric ratio γ > 1 for time-step spacing (only affects numNodes ≥ 2)
-    totalHorizon    0.56   ; total time horizon [s]  (~70% of gait cycle)
+    dt              0.015  ; base time step [s]; totalHorizon = numNodes × dt
+                           ; if omitted, falls back to sqp.dt
 }
 
 ; State Estimation

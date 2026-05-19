@@ -39,7 +39,8 @@ class RneaWbc : public WbcBase {
   double totalHorizon_ = 0.56;
 
   // Cached NLP dimensions and per-node time steps set by buildNlp()
-  int nz_ = 0;
+  int nz_  = 0;
+  int ndx_ = 0;  // delta-state dimension (2*nv); offset of U[0] in the Fatrop z vector
   std::vector<double> dts_;
 
   scalar_t weightSwingLeg_{}, weightBaseAccel_{}, weightContactForce_{};
